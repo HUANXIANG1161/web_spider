@@ -2,23 +2,31 @@ from collections import deque
 import time
 from urllib.parse import urljoin
 
+import logging
+import os
+
 from bs4 import BeautifulSoup
 import requests
+from fetcher import fetch_html
 
 from step2_parse import parse_paper
 
+from robots_policy import RobotsPolicy
 
-def fetch_html(url: str) -> str:
-    headers = {
-    "User-Agent": "CourseSpider/0.1 (course project; contact: 123@example.com)",
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "en-US,en;q=0.9",
-    }
-    response=requests.get(url,headers=headers,timeout=10)
+logger = logging.getLogger(__name__)
 
-    response.raise_for_status()
-    
-    return response.text
+
+def setup_logging() -> None:
+    os.makedirs("logs", exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[
+            logging.FileHandler("logs/crawl.log", encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
 
 
 def extract_links(html: str, base_url: str) -> list[str]:
@@ -32,41 +40,75 @@ def extract_links(html: str, base_url: str) -> list[str]:
     return links
 
 
-def crawl(seed: str, max_pages: int = 4, delay: float = 15.0) -> list[dict]:
+def crawl(seed: str, max_pages: int = 4) -> list[dict]:
+    attempted = 0        # 真正发起请求的页数（受 max_pages 限制）
+    fetched = 0          # 下载成功的页数
+    fetch_failed = 0     # 重试后仍抓取失败的页数
+    parse_failed = 0     # 下载成功但解析失败的页数
+    skipped = 0          # robots 拒绝的 URL 数
+
     queue = deque([seed])
     seen = {seed}
     papers = []
-    fetched = 0
+    policy = RobotsPolicy("CourseSpider")
 
-    while queue and fetched < max_pages:
+    # 第一次会下载 robots.txt，并打印 arXiv 的 15 秒
+    logger.info(f"robots delay: {policy.crawl_delay(seed)}")
+
+    while queue and attempted < max_pages:
         url = queue.popleft()
-        if fetched > 0:
+
+        if not policy.can_fetch(url):
+            logger.warning(f"robots disallow: {url}")
+            skipped += 1
+            continue
+
+        delay = policy.crawl_delay(url)
+        if attempted > 0:
             time.sleep(delay)
 
-        html = fetch_html(url)
-        fetched += 1
-        print(f"[{fetched}/{max_pages}] {url}")
+        attempted += 1
+        logger.info(f"[{attempted}/{max_pages}] {url}")
 
-        # TODO 2：如果 url 是论文摘要页（URL 里有 "/abs/"），
-        #         用 parse_paper(html, url) 解析，加入 papers，并打印标题
+        try:
+            html = fetch_html(url, max_attempts=3, retry_delay=delay)
+        except requests.RequestException as exc:
+            logger.error(f"抓取失败，跳过：{url} -> {exc}")
+            fetch_failed += 1
+            continue
+
+        fetched += 1
+
         if "/abs/" in url:
-            paper=parse_paper(html,url)
+            try:
+                paper = parse_paper(html, url)
+            except Exception:
+                logger.exception(f"解析失败，跳过：{url}")
+                parse_failed += 1
+                continue
+
             papers.append(paper)
-            print("  标题:", paper["title"])
-        # TODO 3：对 extract_links(html, url) 的每个链接：
-        #         如果不在 seen 里，加入 seen，再 append 到 queue
+            logger.info(f"  标题: {paper['title']}")
+
         for link in extract_links(html, url):
             if link not in seen:
                 seen.add(link)
                 queue.append(link)
 
+    logger.info(
+        f"完成：尝试 {attempted} 页，下载成功 {fetched} 页，"
+        f"抓取失败 {fetch_failed} 页，解析失败 {parse_failed} 页，"
+        f"robots 跳过 {skipped} 个，论文 {len(papers)} 篇"
+    )
+
     return papers
 
 
 def main():
+    setup_logging()
     seed = "https://arxiv.org/list/cs.CL/2017-06"
-    papers = crawl(seed, max_pages=4, delay=15)
-    print(f"共抓到 {len(papers)} 篇论文")
+    papers = crawl(seed, max_pages=4)
+    logger.info(f"共抓到 {len(papers)} 篇论文")
 
 
 if __name__ == "__main__":
